@@ -1,0 +1,6 @@
+node_modules/
+betterdrop.db
+betterdrop.db-shm
+betterdrop.db-wal
+.env
+*.log
