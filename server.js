@@ -1,7 +1,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const cookieParser = require('cookie-parser');
-const Database = require('better-sqlite3');
+const { Pool } = require('pg');
 const path = require('path');
 const crypto = require('crypto');
 
