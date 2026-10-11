@@ -8,93 +8,105 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ===== База данных =====
-const db = new Database('betterdrop.db');
-db.pragma('journal_mode = WAL');
+// ===== Подключение к PostgreSQL (ONREZA) =====
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    balance INTEGER DEFAULT 500,
-    inventory TEXT DEFAULT '[]',
-    is_owner INTEGER DEFAULT 0,
-    is_admin INTEGER DEFAULT 0,
-    xp INTEGER DEFAULT 0,
-    total_upgrades INTEGER DEFAULT 0,
-    total_wins INTEGER DEFAULT 0,
-    total_loses INTEGER DEFAULT 0,
-    current_win_streak INTEGER DEFAULT 0,
-    best_win_streak INTEGER DEFAULT 0,
-    stars_spins INTEGER DEFAULT 0,
-    max_bet INTEGER DEFAULT 0,
-    achievements TEXT DEFAULT '[]',
-    ever_owned TEXT DEFAULT '[]',
-    created_at INTEGER
-  );
+// ===== Создание таблиц =====
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      balance INTEGER DEFAULT 500,
+      inventory TEXT DEFAULT '[]',
+      is_owner INTEGER DEFAULT 0,
+      is_admin INTEGER DEFAULT 0,
+      xp INTEGER DEFAULT 0,
+      total_upgrades INTEGER DEFAULT 0,
+      total_wins INTEGER DEFAULT 0,
+      total_loses INTEGER DEFAULT 0,
+      current_win_streak INTEGER DEFAULT 0,
+      best_win_streak INTEGER DEFAULT 0,
+      stars_spins INTEGER DEFAULT 0,
+      max_bet INTEGER DEFAULT 0,
+      achievements TEXT DEFAULT '[]',
+      ever_owned TEXT DEFAULT '[]',
+      created_at BIGINT
+    );
 
-  CREATE TABLE IF NOT EXISTS sessions (
-    token TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL,
-    created_at INTEGER
-  );
+    CREATE TABLE IF NOT EXISTS sessions (
+      token TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      created_at BIGINT
+    );
 
-  CREATE TABLE IF NOT EXISTS deposits (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    username TEXT,
-    amount INTEGER,
-    bonus TEXT,
-    by_owner INTEGER,
-    ts INTEGER
-  );
+    CREATE TABLE IF NOT EXISTS deposits (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER,
+      username TEXT,
+      amount INTEGER,
+      bonus TEXT,
+      by_owner INTEGER,
+      ts BIGINT
+    );
 
-  CREATE TABLE IF NOT EXISTS games (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    username TEXT,
-    from_id TEXT,
-    to_id TEXT,
-    chance REAL,
-    roll INTEGER,
-    win INTEGER,
-    bet INTEGER,
-    mult REAL,
-    mode TEXT,
-    ts INTEGER
-  );
+    CREATE TABLE IF NOT EXISTS games (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER,
+      username TEXT,
+      from_id TEXT,
+      to_id TEXT,
+      chance REAL,
+      roll INTEGER,
+      win INTEGER,
+      bet INTEGER,
+      mult REAL,
+      mode TEXT,
+      ts BIGINT
+    );
 
-  CREATE TABLE IF NOT EXISTS promos (
-    code TEXT PRIMARY KEY,
-    reward INTEGER,
-    uses INTEGER,
-    nft_id TEXT,
-    created_by INTEGER,
-    created_at INTEGER
-  );
+    CREATE TABLE IF NOT EXISTS promos (
+      code TEXT PRIMARY KEY,
+      reward INTEGER,
+      uses INTEGER,
+      nft_id TEXT,
+      created_by INTEGER,
+      created_at BIGINT
+    );
 
-  CREATE TABLE IF NOT EXISTS promo_uses (
-    code TEXT,
-    user_id INTEGER,
-    PRIMARY KEY (code, user_id)
-  );
-`);
+    CREATE TABLE IF NOT EXISTS promo_uses (
+      code TEXT,
+      user_id INTEGER,
+      PRIMARY KEY (code, user_id)
+    );
+  `);
+  console.log('✅ Таблицы готовы');
+}
 
 // ===== Middleware =====
 app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 
-function auth(req, res, next) {
-  const token = req.cookies.token;
-  if (!token) return res.status(401).json({ error: 'Не авторизован' });
-  const session = db.prepare('SELECT * FROM sessions WHERE token = ?').get(token);
-  if (!session) return res.status(401).json({ error: 'Сессия истекла' });
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(session.user_id);
-  if (!user) return res.status(401).json({ error: 'Пользователь не найден' });
-  req.user = user;
-  next();
+async function auth(req, res, next) {
+  try {
+    const token = req.cookies.token;
+    if (!token) return res.status(401).json({ error: 'Не авторизован' });
+    const sessionRes = await pool.query('SELECT * FROM sessions WHERE token = $1', [token]);
+    const session = sessionRes.rows[0];
+    if (!session) return res.status(401).json({ error: 'Сессия истекла' });
+    const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [session.user_id]);
+    const user = userRes.rows[0];
+    if (!user) return res.status(401).json({ error: 'Пользователь не найден' });
+    req.user = user;
+    next();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 }
 
 function publicUser(u) {
@@ -115,235 +127,298 @@ function publicUser(u) {
     maxBet: u.max_bet,
     achievements: JSON.parse(u.achievements || '[]'),
     everOwned: JSON.parse(u.ever_owned || '[]'),
-    createdAt: u.created_at,
+    createdAt: Number(u.created_at),
   };
 }
 
 // ===== Роуты =====
 
-// Регистрация
-app.post('/api/register', (req, res) => {
-  const { username, password } = req.body;
-  if (!username || username.length < 3) return res.status(400).json({ error: 'Логин мин. 3' });
-  if (!password || password.length < 5) return res.status(400).json({ error: 'Пароль мин. 5' });
+app.post('/api/register', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || username.length < 3) return res.status(400).json({ error: 'Логин мин. 3' });
+    if (!password || password.length < 5) return res.status(400).json({ error: 'Пароль мин. 5' });
 
-  const exists = db.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?)').get(username);
-  if (exists) return res.status(400).json({ error: 'Логин занят' });
+    const exists = await pool.query('SELECT id FROM users WHERE LOWER(username) = LOWER($1)', [username]);
+    if (exists.rows.length > 0) return res.status(400).json({ error: 'Логин занят' });
 
-  const hash = bcrypt.hashSync(password, 10);
-  const isFirst = db.prepare('SELECT COUNT(*) as c FROM users').get().c === 0;
+    const hash = bcrypt.hashSync(password, 10);
+    const countRes = await pool.query('SELECT COUNT(*) as c FROM users');
+    const isFirst = parseInt(countRes.rows[0].c, 10) === 0;
 
-  const result = db.prepare(`
-    INSERT INTO users (username, password_hash, balance, inventory, is_owner, created_at)
-    VALUES (?, ?, 500, '[]', ?, ?)
-  `).run(username, hash, isFirst ? 1 : 0, Date.now());
+    const insertRes = await pool.query(
+      `INSERT INTO users (username, password_hash, balance, inventory, is_owner, created_at)
+       VALUES ($1, $2, 500, '[]', $3, $4) RETURNING *`,
+      [username, hash, isFirst ? 1 : 0, Date.now()]
+    );
+    const user = insertRes.rows[0];
 
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(result.lastInsertRowid);
+    const token = crypto.randomBytes(32).toString('hex');
+    await pool.query('INSERT INTO sessions (token, user_id, created_at) VALUES ($1, $2, $3)', [token, user.id, Date.now()]);
 
-  const token = crypto.randomBytes(32).toString('hex');
-  db.prepare('INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)')
-    .run(token, user.id, Date.now());
-
-  res.cookie('token', token, { httpOnly: true, maxAge: 30 * 24 * 60 * 60 * 1000 });
-  res.json({ user: publicUser(user) });
+    res.cookie('token', token, { httpOnly: true, maxAge: 30 * 24 * 60 * 60 * 1000, sameSite: 'lax' });
+    res.json({ user: publicUser(user) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// Вход
-app.post('/api/login', (req, res) => {
-  const { username, password } = req.body;
-  const user = db.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?)').get(username);
-  if (!user) return res.status(400).json({ error: 'Неверный логин' });
-  if (!bcrypt.compareSync(password, user.password_hash)) return res.status(400).json({ error: 'Неверный пароль' });
+app.post('/api/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const userRes = await pool.query('SELECT * FROM users WHERE LOWER(username) = LOWER($1)', [username]);
+    const user = userRes.rows[0];
+    if (!user) return res.status(400).json({ error: 'Неверный логин' });
+    if (!bcrypt.compareSync(password, user.password_hash)) return res.status(400).json({ error: 'Неверный пароль' });
 
-  const token = crypto.randomBytes(32).toString('hex');
-  db.prepare('INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)')
-    .run(token, user.id, Date.now());
+    const token = crypto.randomBytes(32).toString('hex');
+    await pool.query('INSERT INTO sessions (token, user_id, created_at) VALUES ($1, $2, $3)', [token, user.id, Date.now()]);
 
-  res.cookie('token', token, { httpOnly: true, maxAge: 30 * 24 * 60 * 60 * 1000 });
-  res.json({ user: publicUser(user) });
+    res.cookie('token', token, { httpOnly: true, maxAge: 30 * 24 * 60 * 60 * 1000, sameSite: 'lax' });
+    res.json({ user: publicUser(user) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// Выход
-app.post('/api/logout', (req, res) => {
-  const token = req.cookies.token;
-  if (token) db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
-  res.clearCookie('token');
-  res.json({ ok: true });
+app.post('/api/logout', async (req, res) => {
+  try {
+    const token = req.cookies.token;
+    if (token) await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
+    res.clearCookie('token');
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// Текущий юзер
 app.get('/api/me', auth, (req, res) => {
   res.json({ user: publicUser(req.user) });
 });
 
-// Сохранить состояние
-app.post('/api/save', auth, (req, res) => {
-  const u = req.user;
-  const body = req.body;
-
-  db.prepare(`
-    UPDATE users SET
-      balance = ?, inventory = ?, xp = ?, total_upgrades = ?,
-      total_wins = ?, total_loses = ?, current_win_streak = ?,
-      best_win_streak = ?, stars_spins = ?, max_bet = ?,
-      achievements = ?, ever_owned = ?
-    WHERE id = ?
-  `).run(
-    body.balance ?? u.balance,
-    JSON.stringify(body.inventory ?? JSON.parse(u.inventory)),
-    body.xp ?? u.xp,
-    body.totalUpgrades ?? u.total_upgrades,
-    body.totalWins ?? u.total_wins,
-    body.totalLoses ?? u.total_loses,
-    body.currentWinStreak ?? u.current_win_streak,
-    body.bestWinStreak ?? u.best_win_streak,
-    body.starsSpins ?? u.stars_spins,
-    body.maxBet ?? u.max_bet,
-    JSON.stringify(body.achievements ?? JSON.parse(u.achievements)),
-    JSON.stringify(body.everOwned ?? JSON.parse(u.ever_owned)),
-    u.id
-  );
-
-  const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(u.id);
-  res.json({ user: publicUser(updated) });
-});
-
-// Записать игру
-app.post('/api/game', auth, (req, res) => {
-  const { fromId, toId, chance, roll, win, bet, mult, mode } = req.body;
-  db.prepare(`
-    INSERT INTO games (user_id, username, from_id, to_id, chance, roll, win, bet, mult, mode, ts)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(req.user.id, req.user.username, fromId, toId, chance, roll, win ? 1 : 0, bet || 0, mult || 0, mode, Date.now());
-  res.json({ ok: true });
-});
-
-// Список юзеров
-app.get('/api/users', auth, (req, res) => {
-  if (!req.user.is_owner && !req.user.is_admin) return res.status(403).json({ error: 'Нет доступа' });
-  const users = db.prepare('SELECT * FROM users ORDER BY id ASC').all();
-  res.json({ users: users.map(publicUser) });
-});
-
-// Пополнения
-app.get('/api/deposits', auth, (req, res) => {
-  if (!req.user.is_owner && !req.user.is_admin) return res.status(403).json({ error: 'Нет доступа' });
-  const rows = db.prepare('SELECT * FROM deposits ORDER BY ts DESC LIMIT 300').all();
-  res.json({ deposits: rows });
-});
-
-// Игры
-app.get('/api/games', auth, (req, res) => {
-  if (!req.user.is_owner && !req.user.is_admin) return res.status(403).json({ error: 'Нет доступа' });
-  const rows = db.prepare('SELECT * FROM games ORDER BY ts DESC LIMIT 300').all();
-  res.json({ games: rows });
-});
-
-// Выдать звёзды
-app.post('/api/admin/give', auth, (req, res) => {
-  if (!req.user.is_owner && !req.user.is_admin) return res.status(403).json({ error: 'Нет доступа' });
-  const { userId, amount } = req.body;
-  if (!userId || !amount || amount <= 0) return res.status(400).json({ error: 'Неверные данные' });
-  const target = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
-  if (!target) return res.status(404).json({ error: 'Юзер не найден' });
-  db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').run(amount, userId);
-  db.prepare('INSERT INTO deposits (user_id, username, amount, bonus, by_owner, ts) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(userId, target.username, amount, '👑 выдача', req.user.id, Date.now());
-  res.json({ ok: true });
-});
-
-// Выдать всем
-app.post('/api/admin/give-all', auth, (req, res) => {
-  if (!req.user.is_owner && !req.user.is_admin) return res.status(403).json({ error: 'Нет доступа' });
-  const { amount } = req.body;
-  if (!amount || amount <= 0) return res.status(400).json({ error: 'Неверные данные' });
-  const users = db.prepare('SELECT * FROM users').all();
-  const stmt = db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?');
-  const dep = db.prepare('INSERT INTO deposits (user_id, username, amount, bonus, by_owner, ts) VALUES (?, ?, ?, ?, ?, ?)');
-  for (const u of users) {
-    stmt.run(amount, u.id);
-    dep.run(u.id, u.username, amount, '👑 массовая', req.user.id, Date.now());
+app.post('/api/save', auth, async (req, res) => {
+  try {
+    const u = req.user;
+    const b = req.body;
+    await pool.query(
+      `UPDATE users SET
+        balance = $1, inventory = $2, xp = $3, total_upgrades = $4,
+        total_wins = $5, total_loses = $6, current_win_streak = $7,
+        best_win_streak = $8, stars_spins = $9, max_bet = $10,
+        achievements = $11, ever_owned = $12
+       WHERE id = $13`,
+      [
+        b.balance ?? u.balance,
+        JSON.stringify(b.inventory ?? JSON.parse(u.inventory)),
+        b.xp ?? u.xp,
+        b.totalUpgrades ?? u.total_upgrades,
+        b.totalWins ?? u.total_wins,
+        b.totalLoses ?? u.total_loses,
+        b.currentWinStreak ?? u.current_win_streak,
+        b.bestWinStreak ?? u.best_win_streak,
+        b.starsSpins ?? u.stars_spins,
+        b.maxBet ?? u.max_bet,
+        JSON.stringify(b.achievements ?? JSON.parse(u.achievements)),
+        JSON.stringify(b.everOwned ?? JSON.parse(u.ever_owned)),
+        u.id
+      ]
+    );
+    const updated = await pool.query('SELECT * FROM users WHERE id = $1', [u.id]);
+    res.json({ user: publicUser(updated.rows[0]) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-  res.json({ ok: true });
 });
 
-// Роль admin
-app.post('/api/admin/toggle-admin', auth, (req, res) => {
-  if (!req.user.is_owner) return res.status(403).json({ error: 'Только OWNER' });
-  const { userId } = req.body;
-  const target = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
-  if (!target) return res.status(404).json({ error: 'Юзер не найден' });
-  if (target.is_owner) return res.status(400).json({ error: 'OWNER неприкосновенен' });
-  db.prepare('UPDATE users SET is_admin = ? WHERE id = ?').run(target.is_admin ? 0 : 1, userId);
-  res.json({ ok: true });
-});
-
-// Удалить юзера
-app.post('/api/admin/delete', auth, (req, res) => {
-  if (!req.user.is_owner) return res.status(403).json({ error: 'Только OWNER' });
-  const { userId } = req.body;
-  if (userId === req.user.id) return res.status(400).json({ error: 'Себя нельзя' });
-  db.prepare('DELETE FROM users WHERE id = ?').run(userId);
-  res.json({ ok: true });
-});
-
-// Промокоды
-app.get('/api/promos', auth, (req, res) => {
-  if (!req.user.is_owner && !req.user.is_admin) return res.status(403).json({ error: 'Нет доступа' });
-  const promos = db.prepare('SELECT * FROM promos').all();
-  const uses = db.prepare('SELECT code, user_id FROM promo_uses').all();
-  const grouped = {};
-  for (const u of uses) {
-    if (!grouped[u.code]) grouped[u.code] = [];
-    grouped[u.code].push(u.user_id);
+app.post('/api/game', auth, async (req, res) => {
+  try {
+    const { fromId, toId, chance, roll, win, bet, mult, mode } = req.body;
+    await pool.query(
+      `INSERT INTO games (user_id, username, from_id, to_id, chance, roll, win, bet, mult, mode, ts)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+      [req.user.id, req.user.username, fromId, toId, chance, roll, win ? 1 : 0, bet || 0, mult || 0, mode, Date.now()]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-  res.json({ promos, uses: grouped });
 });
 
-app.post('/api/promos', auth, (req, res) => {
-  if (!req.user.is_owner && !req.user.is_admin) return res.status(403).json({ error: 'Нет доступа' });
-  const { code, reward, uses, nftId } = req.body;
-  if (!code || code.length < 3) return res.status(400).json({ error: 'Код мин. 3' });
-  const exists = db.prepare('SELECT code FROM promos WHERE code = ?').get(code);
-  if (exists) return res.status(400).json({ error: 'Уже есть' });
-  db.prepare('INSERT INTO promos (code, reward, uses, nft_id, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(code, reward || 0, uses || 1, nftId || null, req.user.id, Date.now());
-  res.json({ ok: true });
-});
-
-app.post('/api/promos/delete', auth, (req, res) => {
-  if (!req.user.is_owner && !req.user.is_admin) return res.status(403).json({ error: 'Нет доступа' });
-  const { code } = req.body;
-  db.prepare('DELETE FROM promos WHERE code = ?').run(code);
-  db.prepare('DELETE FROM promo_uses WHERE code = ?').run(code);
-  res.json({ ok: true });
-});
-
-app.post('/api/promos/activate', auth, (req, res) => {
-  const { code } = req.body;
-  const promo = db.prepare('SELECT * FROM promos WHERE code = ?').get(code);
-  if (!promo) return res.status(404).json({ error: 'Промокод не найден' });
-  const already = db.prepare('SELECT 1 FROM promo_uses WHERE code = ? AND user_id = ?').get(code, req.user.id);
-  if (already) return res.status(400).json({ error: 'Уже активирован' });
-  const used = db.prepare('SELECT COUNT(*) as c FROM promo_uses WHERE code = ?').get(code).c;
-  if (used >= promo.uses) return res.status(400).json({ error: 'Промокод исчерпан' });
-
-  db.prepare('INSERT INTO promo_uses (code, user_id) VALUES (?, ?)').run(code, req.user.id);
-  if (promo.reward > 0) {
-    db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').run(promo.reward, req.user.id);
+app.get('/api/users', auth, async (req, res) => {
+  try {
+    if (!req.user.is_owner && !req.user.is_admin) return res.status(403).json({ error: 'Нет доступа' });
+    const users = await pool.query('SELECT * FROM users ORDER BY id ASC');
+    res.json({ users: users.rows.map(publicUser) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-  if (promo.nft_id) {
-    const inv = JSON.parse(req.user.inventory || '[]');
-    inv.push(promo.nft_id);
-    const ever = JSON.parse(req.user.ever_owned || '[]');
-    if (!ever.includes(promo.nft_id)) ever.push(promo.nft_id);
-    db.prepare('UPDATE users SET inventory = ?, ever_owned = ? WHERE id = ?')
-      .run(JSON.stringify(inv), JSON.stringify(ever), req.user.id);
-  }
-  res.json({ ok: true, reward: promo.reward, nftId: promo.nft_id });
 });
 
-// Старт
-app.listen(PORT, () => {
-  console.log(`✅ BetterDrop запущен: http://localhost:${PORT}`);
+app.get('/api/deposits', auth, async (req, res) => {
+  try {
+    if (!req.user.is_owner && !req.user.is_admin) return res.status(403).json({ error: 'Нет доступа' });
+    const rows = await pool.query('SELECT * FROM deposits ORDER BY ts DESC LIMIT 300');
+    res.json({ deposits: rows.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/games', auth, async (req, res) => {
+  try {
+    if (!req.user.is_owner && !req.user.is_admin) return res.status(403).json({ error: 'Нет доступа' });
+    const rows = await pool.query('SELECT * FROM games ORDER BY ts DESC LIMIT 300');
+    res.json({ games: rows.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/give', auth, async (req, res) => {
+  try {
+    if (!req.user.is_owner && !req.user.is_admin) return res.status(403).json({ error: 'Нет доступа' });
+    const { userId, amount } = req.body;
+    if (!userId || !amount || amount <= 0) return res.status(400).json({ error: 'Неверные данные' });
+    const targetRes = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
+    const target = targetRes.rows[0];
+    if (!target) return res.status(404).json({ error: 'Юзер не найден' });
+    await pool.query('UPDATE users SET balance = balance + $1 WHERE id = $2', [amount, userId]);
+    await pool.query(
+      'INSERT INTO deposits (user_id, username, amount, bonus, by_owner, ts) VALUES ($1, $2, $3, $4, $5, $6)',
+      [userId, target.username, amount, '👑 выдача', req.user.id, Date.now()]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/give-all', auth, async (req, res) => {
+  try {
+    if (!req.user.is_owner && !req.user.is_admin) return res.status(403).json({ error: 'Нет доступа' });
+    const { amount } = req.body;
+    if (!amount || amount <= 0) return res.status(400).json({ error: 'Неверные данные' });
+    const users = await pool.query('SELECT * FROM users');
+    for (const u of users.rows) {
+      await pool.query('UPDATE users SET balance = balance + $1 WHERE id = $2', [amount, u.id]);
+      await pool.query(
+        'INSERT INTO deposits (user_id, username, amount, bonus, by_owner, ts) VALUES ($1, $2, $3, $4, $5, $6)',
+        [u.id, u.username, amount, '👑 массовая', req.user.id, Date.now()]
+      );
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/toggle-admin', auth, async (req, res) => {
+  try {
+    if (!req.user.is_owner) return res.status(403).json({ error: 'Только OWNER' });
+    const { userId } = req.body;
+    const targetRes = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
+    const target = targetRes.rows[0];
+    if (!target) return res.status(404).json({ error: 'Юзер не найден' });
+    if (target.is_owner) return res.status(400).json({ error: 'OWNER неприкосновенен' });
+    await pool.query('UPDATE users SET is_admin = $1 WHERE id = $2', [target.is_admin ? 0 : 1, userId]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/delete', auth, async (req, res) => {
+  try {
+    if (!req.user.is_owner) return res.status(403).json({ error: 'Только OWNER' });
+    const { userId } = req.body;
+    if (userId === req.user.id) return res.status(400).json({ error: 'Себя нельзя' });
+    await pool.query('DELETE FROM users WHERE id = $1', [userId]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/promos', auth, async (req, res) => {
+  try {
+    if (!req.user.is_owner && !req.user.is_admin) return res.status(403).json({ error: 'Нет доступа' });
+    const promos = await pool.query('SELECT * FROM promos');
+    const uses = await pool.query('SELECT code, user_id FROM promo_uses');
+    const grouped = {};
+    for (const u of uses.rows) {
+      if (!grouped[u.code]) grouped[u.code] = [];
+      grouped[u.code].push(u.user_id);
+    }
+    res.json({ promos: promos.rows, uses: grouped });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/promos', auth, async (req, res) => {
+  try {
+    if (!req.user.is_owner && !req.user.is_admin) return res.status(403).json({ error: 'Нет доступа' });
+    const { code, reward, uses, nftId } = req.body;
+    if (!code || code.length < 3) return res.status(400).json({ error: 'Код мин. 3' });
+    const exists = await pool.query('SELECT code FROM promos WHERE code = $1', [code]);
+    if (exists.rows.length > 0) return res.status(400).json({ error: 'Уже есть' });
+    await pool.query(
+      'INSERT INTO promos (code, reward, uses, nft_id, created_by, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      [code, reward || 0, uses || 1, nftId || null, req.user.id, Date.now()]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/promos/delete', auth, async (req, res) => {
+  try {
+    if (!req.user.is_owner && !req.user.is_admin) return res.status(403).json({ error: 'Нет доступа' });
+    const { code } = req.body;
+    await pool.query('DELETE FROM promos WHERE code = $1', [code]);
+    await pool.query('DELETE FROM promo_uses WHERE code = $1', [code]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/promos/activate', auth, async (req, res) => {
+  try {
+    const { code } = req.body;
+    const promoRes = await pool.query('SELECT * FROM promos WHERE code = $1', [code]);
+    const promo = promoRes.rows[0];
+    if (!promo) return res.status(404).json({ error: 'Промокод не найден' });
+    const already = await pool.query('SELECT 1 FROM promo_uses WHERE code = $1 AND user_id = $2', [code, req.user.id]);
+    if (already.rows.length > 0) return res.status(400).json({ error: 'Уже активирован' });
+    const usedRes = await pool.query('SELECT COUNT(*) as c FROM promo_uses WHERE code = $1', [code]);
+    if (parseInt(usedRes.rows[0].c, 10) >= promo.uses) return res.status(400).json({ error: 'Промокод исчерпан' });
+
+    await pool.query('INSERT INTO promo_uses (code, user_id) VALUES ($1, $2)', [code, req.user.id]);
+    if (promo.reward > 0) {
+      await pool.query('UPDATE users SET balance = balance + $1 WHERE id = $2', [promo.reward, req.user.id]);
+    }
+    if (promo.nft_id) {
+      const inv = JSON.parse(req.user.inventory || '[]');
+      inv.push(promo.nft_id);
+      const ever = JSON.parse(req.user.ever_owned || '[]');
+      if (!ever.includes(promo.nft_id)) ever.push(promo.nft_id);
+      await pool.query('UPDATE users SET inventory = $1, ever_owned = $2 WHERE id = $3',
+        [JSON.stringify(inv), JSON.stringify(ever), req.user.id]);
+    }
+    res.json({ ok: true, reward: promo.reward, nftId: promo.nft_id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== Старт =====
+initDb().then(() => {
+  app.listen(PORT, () => {
+    console.log(`✅ BetterDrop запущен: http://localhost:${PORT}`);
+  });
+}).catch(err => {
+  console.error('❌ Ошибка инициализации БД:', err.message);
+  process.exit(1);
 });
